@@ -1,0 +1,10 @@
+{
+  "parallel": true,
+  "concurrency": 5,
+  "intervalCap": 50,
+  "logSize": 15,
+  "directory": "",
+  "mode": 1,
+  "useSubfolder": true,
+  "collectionDbPath": ""
+}
