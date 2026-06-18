@@ -6,5 +6,11 @@
   "directory": "",
   "mode": 1,
   "useSubfolder": true,
-  "collectionDbPath": ""
+  "osuPath": "",
+  "mirror": "catboy",
+  "catboyServer": "default",
+  "skipExisting": true,
+  "backupRetention": 30,
+  "mirrorRotation": false,
+  "noVideo": true
 }

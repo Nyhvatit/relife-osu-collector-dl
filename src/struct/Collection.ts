@@ -38,11 +38,25 @@ export class Collection {
     this.id = id;
     this.name = name;
     this.uploader = uploader;
-    // Parse beatmapsets and count beatmaps in one pass
     const { beatMapSets, beatMapCount } = this._resolveBeatMapSets(beatmapsets);
     this.beatMapSets = beatMapSets;
     this.beatMapSetCount = beatMapSets.size;
     this.beatMapCount = beatMapCount;
+  }
+
+  load(
+    id: CollectionId,
+    name: string,
+    beatMapSets: Map<BeatMapSetId, BeatMapSet>,
+    beatMapCount: number,
+    uploaderName: string
+  ): void {
+    this.id = id;
+    this.name = name;
+    this.beatMapSets = beatMapSets;
+    this.beatMapSetCount = beatMapSets.size;
+    this.beatMapCount = beatMapCount;
+    this.uploader = { username: uploaderName };
   }
 
   getCollectionName(): string {
@@ -51,6 +65,16 @@ export class Collection {
 
   getCollectionFolderName(): string {
     return this.id.toString() + " - " + this.getCollectionName();
+  }
+
+  keepOnly(ids: Iterable<number>): void {
+    const filtered = new Map<BeatMapSetId, BeatMapSet>();
+    for (const id of ids) {
+      const set = this.beatMapSets.get(id);
+      if (set) filtered.set(id, set);
+    }
+    this.beatMapSets = filtered;
+    this.beatMapSetCount = filtered.size;
   }
 
   resolveFullData(jsonBeatMaps: v2ResBeatMapType[]): void {
@@ -87,8 +111,6 @@ export class Collection {
     }
   }
 
-  // Parse beatmapsets with beatmaps count in single array pass
-  // Optimization: avoid double iteration over array
   private _resolveBeatMapSets(
     jsonBeatMapSets: v1ResBeatMapSetType[]
   ): { beatMapSets: Map<number, BeatMapSet>; beatMapCount: number } {

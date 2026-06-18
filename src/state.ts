@@ -2,7 +2,6 @@ import { existsSync, readFileSync } from "fs";
 import { Collection } from "./struct/Collection";
 import Config from "./struct/Config";
 
-// Global application state
 export const collection = new Collection();
 
 const configPath = Config.configFilePath;

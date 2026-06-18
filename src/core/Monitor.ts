@@ -1,11 +1,11 @@
 import chalk from "chalk";
-import { clear, log } from "console";
 import { formatMessage, Msg } from "../struct/Message";
 import OcdlError from "../struct/OcdlError";
 import { setTerminalTitle } from "../util";
 import { collection, config } from "../state";
 import promptSync from "prompt-sync";
 import { LIB_VERSION } from "../version";
+import { MirrorStatsView } from "../types";
 
 interface Condition {
   retry_input: boolean;
@@ -15,6 +15,7 @@ interface Condition {
   remaining_downloads: number | null;
   downloaded_beatmapset: number;
   download_log: string[];
+  mirror_stats: MirrorStatsView[];
 }
 
 export enum DisplayTextColor {
@@ -31,8 +32,14 @@ export enum FreezeCondition {
   ERRORED,
 }
 
-// Special symbol for go back signal
 export const GO_BACK_SIGNAL = Symbol("GO_BACK");
+
+export class BackToMenu extends Error {
+  constructor() {
+    super("back-to-menu");
+    this.name = "BackToMenu";
+  }
+}
 
 export default class Monitor {
   private progress = 0;
@@ -49,11 +56,11 @@ export default class Monitor {
       downloaded_beatmapset: 0,
       remaining_downloads: null,
       download_log: [],
+      mirror_stats: [],
     };
 
-    setTerminalTitle(`osu-collector-dl v${LIB_VERSION}`);
+    setTerminalTitle(`relife-ocdl v${LIB_VERSION}`);
 
-    // Tasks numbered without mode selection (mode is taken from settings)
     this.task = {
       0: () => undefined,
       1: this.p_input_id.bind(this),
@@ -66,7 +73,7 @@ export default class Monitor {
   }
 
   update(): void {
-    clear();
+    console.clear();
 
     this.displayHeader();
 
@@ -97,9 +104,11 @@ export default class Monitor {
 
     this.displayMessage(message, variable, messageColor);
 
-    this.awaitInput(Msg.FREEZE, {
-      action: freezeCondition == FreezeCondition.ERRORED ? "exit" : "continue",
-    });
+    this.prompt(
+      formatMessage(Msg.FREEZE, {
+        action: freezeCondition == FreezeCondition.ERRORED ? "exit" : "continue",
+      }) + " "
+    );
 
     if (freezeCondition == FreezeCondition.ERRORED) {
       process.exit(1);
@@ -111,7 +120,15 @@ export default class Monitor {
     variable: Record<string, string> = {},
     color: DisplayTextColor = DisplayTextColor.WHITE
   ) {
-    log(chalk`{${color} ${formatMessage(message, variable)}}`);
+    console.log(chalk`{${color} ${formatMessage(message, variable)}}`);
+  }
+
+  section(title: string, info?: string): void {
+    const cols = Math.min(process.stdout.columns || 60, 60);
+    const head = `── ${title} `;
+    console.log(chalk.cyan(head + "─".repeat(Math.max(0, cols - head.length))));
+    if (info) console.log(chalk.grey(` ${info}`));
+    console.log("");
   }
 
   awaitInput(
@@ -119,40 +136,24 @@ export default class Monitor {
     variable: Record<string, string> = {},
     defaultValue = ""
   ): string {
-    return this.prompt(formatMessage(message, variable) + " ", defaultValue);
-  }
-
-  // Input with go back support (empty input = go back)
-  awaitInputWithBack(
-    message: Msg,
-    variable: Record<string, string> = {}
-  ): string | typeof GO_BACK_SIGNAL {
-    // Show go back hint
-    this.displayMessage(Msg.GO_BACK_HINT, {}, DisplayTextColor.SECONDARY);
-    // Don't pass defaultValue so empty Enter returns empty string
-    const input = this.prompt(formatMessage(message, variable) + " ");
-
-    // Empty input or null = go back signal
-    if (!input || input.trim() === "") {
-      return GO_BACK_SIGNAL;
+    const input = this.prompt(formatMessage(message, variable) + " ", defaultValue);
+    if (typeof input === "string" && input.trim().toLowerCase() === "q") {
+      throw new BackToMenu();
     }
     return input;
   }
 
-  // Go back to previous stage
-  previousTask(): void {
-    if (this.progress > 1) {
-      this.progress--;
-      this.resetConditions();
-      this.update();
-    }
-  }
+  awaitInputWithBack(
+    message: Msg,
+    variable: Record<string, string> = {}
+  ): string | typeof GO_BACK_SIGNAL {
+    this.displayMessage(Msg.GO_BACK_HINT, {}, DisplayTextColor.SECONDARY);
+    const input = this.prompt(formatMessage(message, variable) + " ");
 
-  // Reset conditions when going back
-  private resetConditions(): void {
-    this.condition.retry_input = false;
-    this.condition.missing_log_found = false;
-    this.condition.retry_missing_log_input = false;
+    if (!input || input.trim() === "" || input.trim().toLowerCase() === "q") {
+      return GO_BACK_SIGNAL;
+    }
+    return input;
   }
 
   nextTask(): void {
@@ -169,7 +170,6 @@ export default class Monitor {
     Object.assign(this.condition, new_condition);
   }
 
-  // Add entry to download log with size limit
   appendDownloadLog(
     message: Msg,
     variable: Record<string, string> = {},
@@ -177,7 +177,6 @@ export default class Monitor {
   ): void {
     const logEntry = chalk`{${color} ${formatMessage(message, variable)}}`;
     this.condition.download_log.unshift(logEntry);
-    // Trim array to max size (more efficient than splice for each entry)
     if (this.condition.download_log.length > config.logSize) {
       this.condition.download_log.length = config.logSize;
     }
@@ -190,6 +189,7 @@ export default class Monitor {
         id: collection.id.toString(),
         name: collection.name,
         mode: config.mode.toString(),
+        mirror: config.mirrorRotation ? "switch" : config.mirror,
       },
       DisplayTextColor.PRIMARY
     );
@@ -239,6 +239,22 @@ export default class Monitor {
       this.displayMessage(Msg.REMAINING_DOWNLOADS, {
         amount: this.condition.remaining_downloads.toString(),
       });
+    }
+
+    const activeMirrors = this.condition.mirror_stats.filter(
+      (s) => s.ok > 0 || s.fail > 0 || s.active > 0 || s.notfound > 0
+    );
+    if (activeMirrors.length > 0) {
+      const parts = activeMirrors.map((s) => {
+        const name = s.banned
+          ? chalk`{magenta ${s.mirror}}`
+          : chalk`{white ${s.mirror}}`;
+        const fail = s.fail > 0 ? chalk` {red ${s.fail}}` : "";
+        const notfound = s.notfound > 0 ? chalk` {blue ${s.notfound}}` : "";
+        const active = s.active > 0 ? chalk` {grey ${s.active}}` : "";
+        return name + chalk` {green ${s.ok}}` + fail + notfound + active;
+      });
+      console.log(chalk`{cyanBright Mirrors:} ` + parts.join(chalk`{grey  |  }`));
     }
 
     this.displayMessage(Msg.DOWNLOAD_FILES, {

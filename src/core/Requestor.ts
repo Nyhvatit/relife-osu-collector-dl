@@ -1,10 +1,13 @@
 import { Response, fetch, request } from "undici";
-import { Constant, Mirror, MirrorUrls, getCatboyDownloadUrl, getCatboyRateLimitUrl } from "../struct/Constant";
-import { Json, Mode } from "../types";
+import { Constant, Mirror, Mirrors, getCatboyRateLimitUrl } from "../struct/Constant";
+import { Json, Mode, ResolvedBeatmap } from "../types";
 import OcdlError from "../struct/OcdlError";
 import { CollectionId } from "../struct/Collection";
 import { LIB_VERSION } from "../version";
 import { config } from "../state";
+import { UserUploadsSchema, ResolvedBeatmapSchema, RateLimitSchema } from "./schemas";
+
+const APP_UA = `relife-ocdl/v${LIB_VERSION}`;
 
 interface FetchCollectionQuery {
   perPage?: number;
@@ -13,6 +16,7 @@ interface FetchCollectionQuery {
 
 interface DownloadCollectionOptions {
   mirror?: Mirror;
+  signal?: AbortSignal;
 }
 
 interface FetchCollectionOptions {
@@ -20,7 +24,22 @@ interface FetchCollectionOptions {
   cursor?: number;
 }
 
-// Basic collection data types
+export interface UserCollectionSummary {
+  id: number;
+  name: string;
+  beatmapCount: number;
+}
+
+export interface UserTournamentSummary {
+  id: number;
+  name: string;
+}
+
+export interface UserUploads {
+  collections: UserCollectionSummary[];
+  tournaments: UserTournamentSummary[];
+}
+
 export interface v1ResCollectionType extends Json {
   beatmapIds: v1ResBeatMapType[];
   beatmapsets: v1ResBeatMapSetType[];
@@ -39,7 +58,6 @@ export interface v1ResBeatMapType extends Json {
   id: number;
 }
 
-// Full collection data types
 export interface v2ResCollectionType extends Json {
   hasMore: boolean;
   nextPageCursor: number;
@@ -64,48 +82,26 @@ export class Requestor {
     options: DownloadCollectionOptions = {}
   ): Promise<Response> {
     const mirror = options.mirror ?? config.mirror;
-    // For Catboy, use the selected server's base URL
-    const mirrorBaseUrl = mirror === Mirror.Catboy
-      ? getCatboyDownloadUrl(config.catboyServer)
-      : MirrorUrls[mirror];
-    const baseUrl = mirrorBaseUrl + id.toString();
 
-    // Add noVideo parameter for mirrors that support it
-    // Sayobot already has novideo in the URL path
-    const url = mirror === Mirror.Nerinyan || mirror === Mirror.Catboy
-      ? baseUrl + "?noVideo=1"
-      : baseUrl;
+    const url = Mirrors[mirror].buildDownloadUrl(id, config.noVideo, config.catboyServer);
 
     const res = await fetch(url, {
-      headers: { "User-Agent": `osu-collector-dl/v${LIB_VERSION}` },
+      headers: { "User-Agent": APP_UA },
       method: "GET",
+      signal: options.signal,
     });
     return res;
   }
 
-  static async fetchCollection(
-    id: CollectionId,
-    options: FetchCollectionOptions = { v2: false }
+  private static async _requestJson(
+    url: string,
+    query?: FetchCollectionQuery
   ): Promise<Json> {
-    const { v2, cursor } = options;
-    // Use different endpoint for different version of api request
-    const url =
-      Constant.OsuCollectorApiUrl + id.toString() + (v2 ? "/beatmapsV2" : "");
-
-    const query: FetchCollectionQuery = // Query is needed for V2 collection
-      v2
-        ? {
-            perPage: 100,
-            cursor, // Cursor which point to the next page
-          }
-        : {};
-
     const data = await request(url, { method: "GET", query })
       .then(async (res) => {
         if (res.statusCode !== 200) {
           throw `Status code: ${res.statusCode}`;
         }
-
         return (await res.body.json()) as Json;
       })
       .catch((e: unknown) => {
@@ -119,19 +115,97 @@ export class Requestor {
     return data;
   }
 
+  static async fetchCollection(
+    id: CollectionId,
+    options: FetchCollectionOptions = { v2: false }
+  ): Promise<Json> {
+    const { v2, cursor } = options;
+    const url =
+      Constant.OsuCollectorApiUrl + id.toString() + (v2 ? "/beatmapsV2" : "");
+
+    const query: FetchCollectionQuery =
+      v2
+        ? {
+            perPage: 100,
+            cursor,
+          }
+        : {};
+
+    return this._requestJson(url, query);
+  }
+
+  static async fetchUserUploads(userId: number): Promise<UserUploads> {
+    const url = Constant.OsuCollectorApiUrl.replace("collections", "users") + userId.toString() + "/uploads";
+
+    const parsed = UserUploadsSchema.safeParse(await this._requestJson(url));
+    const raw = parsed.success ? parsed.data : {};
+
+    const collections: UserCollectionSummary[] = (raw.collections ?? []).map((c) => ({
+      id: c.id,
+      name: c.name ?? "Unknown",
+      beatmapCount: c.beatmapCount ?? 0,
+    }));
+    const tournaments: UserTournamentSummary[] = (raw.tournaments ?? []).map((t) => ({
+      id: t.id,
+      name: t.name ?? "Unknown",
+    }));
+
+    return { collections, tournaments };
+  }
+
+  static async fetchTournament(id: number): Promise<Json> {
+    const url = Constant.OsuCollectorApiUrl.replace("collections", "tournaments") + id.toString();
+    return this._requestJson(url);
+  }
+
+  static async resolveBeatmap(beatmapId: number): Promise<ResolvedBeatmap | null> {
+    const endpoints = [
+      `https://osu.direct/api/v2/b/${beatmapId}`,
+      `https://catboy.best/api/v2/b/${beatmapId}`,
+    ];
+
+    for (const url of endpoints) {
+      try {
+        const res = await request(url, {
+          method: "GET",
+          headers: { "User-Agent": APP_UA },
+        });
+        if (res.statusCode !== 200) continue;
+
+        const parsed = ResolvedBeatmapSchema.safeParse(await res.body.json());
+        if (parsed.success) {
+          const d = parsed.data;
+          return {
+            beatmapsetId: d.beatmapset_id,
+            checksum: d.checksum,
+            version: d.version,
+            mode: d.mode,
+            difficulty_rating: d.difficulty_rating,
+          };
+        }
+      } catch {
+      }
+    }
+
+    return null;
+  }
+
   static async checkRateLimitation(): Promise<number | null> {
     const rateLimitUrl = getCatboyRateLimitUrl(config.catboyServer);
-    const res = await request(rateLimitUrl, {
-      method: "GET",
-      headers: { "User-Agent": `osu-collector-dl/v${LIB_VERSION}` },
-    });
+    try {
+      const res = await request(rateLimitUrl, {
+        method: "GET",
+        headers: { "User-Agent": APP_UA },
+      });
 
-    if (!res || res.statusCode !== 200) return null;
-    const data = (await res.body.json().catch(() => null)) as Json | null;
-    if (!data) return null;
+      if (!res || res.statusCode !== 200) return null;
+      const parsed = RateLimitSchema.safeParse(await res.body.json().catch(() => null));
+      if (!parsed.success) return null;
 
-    // Return remaining beatmaps that can be request to download
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any
-    return ((data as any).daily?.remaining?.downloads ?? null) as number | null;
+      const remaining = parsed.data.remaining ?? parsed.data.daily?.remaining?.downloads;
+      return typeof remaining === "number" ? remaining : null;
+    } catch {
+      return null;
+    }
   }
 }
